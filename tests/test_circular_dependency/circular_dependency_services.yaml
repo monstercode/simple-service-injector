@@ -1,0 +1,19 @@
+
+service-one:
+
+  class: tests.test_circular_dependency.examples_classes.SingleParamService
+  named_arguments:
+    param_one: '@service-two'
+
+
+service-two:
+  class: tests.test_circular_dependency.examples_classes.SingleParamService
+  named_arguments:
+    param_one: '@service-three'
+
+
+service-three:
+  class: tests.test_circular_dependency.examples_classes.SingleParamService
+  named_arguments:
+    param_one: '@service-one'
+

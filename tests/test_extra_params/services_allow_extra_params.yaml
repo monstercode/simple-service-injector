@@ -1,0 +1,7 @@
+example-user-updater:
+  class: tests.test_extra_params.example_classes.ExampleUserUpdaterService
+  named_arguments:
+    no_param_service: '@no-params-service'
+
+no-params-service:
+  class: tests.test_extra_params.example_classes.NoParamsService

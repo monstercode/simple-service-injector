@@ -1,0 +1,2 @@
+no-params-service-file-one:
+  class: tests.services.service_provider.test_simple_service.example_classes.NoParamsService

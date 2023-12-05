@@ -1,0 +1,10 @@
+
+simple-service:
+  class: tests.test_simple_service.example_classes.SimpleService
+  named_arguments:
+    param_one: $PYTHON_SERVICE_PROVIDER_TEST_ENV
+    param_two: ^tests.test_simple_service.example_settings.example_object
+    param_three: '@no-params-service'
+
+no-params-service:
+  class: tests.test_simple_service.example_classes.NoParamsService

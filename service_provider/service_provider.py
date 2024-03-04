@@ -125,7 +125,7 @@ class ServiceProvider:
 
     def _instanciate_service(self, service_name, *extra_args, **extra_kwargs):
         # check if is singleton and if instanciated
-        if self.all_services_config[service_name].get("is_singleton") and self.singleton_services[service_name]:
+        if self.all_services_config[service_name].get("is_singleton") and self.singleton_services.get(service_name):
             return self.singleton_services[service_name]
 
         args_service_dependencies = self.all_services_config[service_name].get("arguments", [])

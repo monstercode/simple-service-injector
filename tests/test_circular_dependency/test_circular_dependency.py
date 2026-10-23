@@ -1,8 +1,10 @@
-import pytest
 import os
-from service_provider.service_provider import ServiceProvider
-from service_provider.service_provider import MaxDependencyDepthReachedError
+
+import pytest
+
+from service_provider.service_provider import ServiceProvider, CircularDependencyError
+
 
 def test_circular_dependency():
-    with pytest.raises(MaxDependencyDepthReachedError):
-        services = ServiceProvider(f"{os.path.dirname(__file__)}/circular_dependency_services.yaml")
+    with pytest.raises(CircularDependencyError, match="Circular dependency detected"):
+        ServiceProvider(f"{os.path.dirname(__file__)}/circular_dependency_services.yaml")

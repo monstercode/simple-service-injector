@@ -1,6 +1,8 @@
-import yaml
-import os
 import importlib
+import os
+import threading
+
+import yaml
 
 
 class DuplicatedServiceNameError(Exception):
@@ -19,11 +21,19 @@ class UnknownConfigurationKeyError(Exception):
     pass
 
 
+class InvalidConfigurationValueError(Exception):
+    pass
+
+
 class UnknownServiceNameError(Exception):
     pass
 
 
 class MaxDependencyDepthReachedError(Exception):
+    """Kept for backwards compatibility, see CircularDependencyError."""
+
+
+class CircularDependencyError(MaxDependencyDepthReachedError):
     pass
 
 
@@ -45,155 +55,217 @@ class ServiceProvider:
     ENV_VAR_REFERENCE = "$"
     VALID_SERVICE_KEYS = {"class", "arguments", "named_arguments", "is_singleton"}
 
-    MAX_DEPENDENCY_DEPTH = 100
-
     def __init__(self, *services_conf_paths):
         self.all_services_config = {}
         self.singleton_services = {}
         self.manually_set_services = {}
+        # Reentrant because a singleton can depend on other singletons
+        self._singleton_lock = threading.RLock()
         self._load_services_from_yaml(*services_conf_paths)
         self._check_services_configuration()
         self._check_circular_dependencies()
 
+    # ------------------------------------------------------------------
+    # Loading and validation
+    # ------------------------------------------------------------------
     def _load_services_from_yaml(self, *services_conf_paths):
-        services_conf_paths = list(set(services_conf_paths))
+        origins = {}
 
-        for service_conf_path in services_conf_paths:
+        # dict.fromkeys removes duplicated paths but keeps the order
+        for service_conf_path in dict.fromkeys(services_conf_paths):
             with open(service_conf_path, "r") as fp:
-                service_conf = yaml.full_load(fp.read())
+                service_conf = yaml.safe_load(fp) or {}
 
-                for service_name in service_conf:
-                    service_conf[service_name]["__original_file_path"] = service_conf_path
+            if not isinstance(service_conf, dict):
+                raise InvalidConfigurationValueError(
+                    f"The file {service_conf_path} must contain a mapping of service names to definitions"
+                )
 
-                    if service_name in self.all_services_config:
-                        raise DuplicatedServiceNameError(
-                            f"Service {service_name} is defined twice in {service_conf_path} and {self.all_services_config[service_name]['__original_file_path']}"
-                        )
+            for service_name, definition in service_conf.items():
+                if service_name in self.all_services_config:
+                    raise DuplicatedServiceNameError(
+                        f"Service {service_name} is defined twice in {service_conf_path} and {origins[service_name]}"
+                    )
 
-                    self.all_services_config[service_name] = service_conf[service_name]
+                # A service with an empty body is reported later as a missing 'class' key
+                if definition is None:
+                    definition = {}
+                if not isinstance(definition, dict):
+                    raise InvalidConfigurationValueError(
+                        f"The definition of service {service_name} in {service_conf_path} must be a mapping"
+                    )
 
-        for service_name in self.all_services_config:
-            self.all_services_config[service_name].pop("__original_file_path")
+                self.all_services_config[service_name] = definition
+                origins[service_name] = service_conf_path
 
     def _check_services_configuration(self):
         for service_name, service_config in self.all_services_config.items():
             if "class" not in service_config:
-                raise MissingConfigurationKeyError("Missing 'class' key in service {service_name}")
+                raise MissingConfigurationKeyError(f"Missing 'class' key in service {service_name}")
 
             unknown_service_keys = set(service_config.keys()).difference(self.VALID_SERVICE_KEYS)
             if unknown_service_keys:
                 raise UnknownConfigurationKeyError(
-                    f"Unknown configuration keys '{unknown_service_keys}' for service {service_name}"
+                    f"Unknown configuration keys {sorted(unknown_service_keys)} for service {service_name}"
                 )
 
-    def _check_circular_dependencies(self):
-        validated_services = dict()
-        for service_name in self.all_services_config:
-            validated_services[service_name] = False
+            # Normalize optional keys so the rest of the code can rely on them
+            arguments = service_config.get("arguments")
+            if arguments is None:
+                arguments = []
+            if not isinstance(arguments, list):
+                raise InvalidConfigurationValueError(f"'arguments' of service {service_name} must be a list")
+            service_config["arguments"] = arguments
 
-        count = 0
-        while not all(validated_services.values()):
-            for service_name, config in self.all_services_config.items():
-                # We first get all the dependencies
-                all_service_dependencies = list(config.get("arguments", [])) + list(
-                    config.get("named_arguments", {}).values())
-                # Then we filter to get only the ones that are actual services and not objects or environment variables
-                # We'll eventually reach services that don't depend upon other services, those will be marked as validated services
-                # and the ones that depend on the just validated one will have that dependency validated as well.
-                # Eventually, all dependencies will get validated
-                services_dependencies = [
-                    self._get_clean_service_name(dependency)
-                    for dependency in all_service_dependencies
-                    if dependency.startswith(self.SERVICE_REFERENCE) and not validated_services.get(
-                        self._get_clean_service_name(dependency))
-                ]
+            named_arguments = service_config.get("named_arguments")
+            if named_arguments is None:
+                named_arguments = {}
+            if not isinstance(named_arguments, dict):
+                raise InvalidConfigurationValueError(f"'named_arguments' of service {service_name} must be a mapping")
+            service_config["named_arguments"] = named_arguments
 
-                # if we need to inject another service in this service, which is not defined, raise an exception
-                for service_dependency_name in services_dependencies:
-                    if service_dependency_name not in self.all_services_config:
-                        raise UnknownServiceNameError(
-                            f"Service '{service_name}' depends on unknown service '{service_dependency_name}''. Defined services are {self.get_all_services_names()}")
-
-                validated_services[service_name] = len(services_dependencies) == 0
-            count += 1
-
-            # If after too many rounds we still have services that depends on other services that are
-            #  not validated (because they depend on other services that need to be validated),
-            #  we get to the conclusion that we are in a circular dependency case
-            if count > self.MAX_DEPENDENCY_DEPTH:
-                raise MaxDependencyDepthReachedError()
-
-    def _instanciate_service(self, service_name, *extra_args, **extra_kwargs):
-        # check if is singleton and if instanciated
-        if self.all_services_config[service_name].get("is_singleton") and self.singleton_services.get(service_name):
-            return self.singleton_services[service_name]
-
-        args_service_dependencies = self.all_services_config[service_name].get("arguments", [])
-        arguments = [self._get_arg_value(arg, service_name) for arg in args_service_dependencies]
-
-        kwargs = {
-            key: self._get_arg_value(arg, service_name)
-            for key, arg in self.all_services_config[service_name].get("named_arguments", {}).items()
-        }
-
-        if not extra_args:
-            extra_args = ()
-        if not extra_kwargs:
-            extra_kwargs = {}
-
-        for key in extra_kwargs:
-            if key in kwargs:
-                kwargs.pop(key)
-
-        try:
-            clss = self._import_object(self.all_services_config[service_name]["class"])
-        except ImportError:
-            raise ImportingObjectError(
-                f"Couldn't import the class {self.all_services_config[service_name]['class']} for service {service_name}"
+            service_config["is_singleton"] = self._parse_is_singleton(
+                service_config.get("is_singleton", False), service_name
             )
 
+    @staticmethod
+    def _parse_is_singleton(value, service_name):
+        if isinstance(value, bool):
+            return value
+        # Quoted values in YAML ('false') arrive as strings, which are always truthy
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        raise InvalidConfigurationValueError(
+            f"'is_singleton' of service {service_name} must be true or false, got {value!r}"
+        )
+
+    def _is_service_reference(self, arg):
+        return isinstance(arg, str) and arg.startswith(self.SERVICE_REFERENCE)
+
+    def _get_service_dependencies(self, config):
+        all_arguments = list(config["arguments"]) + list(config["named_arguments"].values())
+        return [self._get_clean_service_name(arg) for arg in all_arguments if self._is_service_reference(arg)]
+
+    def _check_circular_dependencies(self):
+        graph = {}
+        for service_name, config in self.all_services_config.items():
+            dependencies = self._get_service_dependencies(config)
+            for dependency in dependencies:
+                if dependency not in self.all_services_config:
+                    raise UnknownServiceNameError(
+                        f"Service '{service_name}' depends on unknown service '{dependency}'. "
+                        f"Defined services are {self.get_all_services_names()}"
+                    )
+            graph[service_name] = dependencies
+
+        # Iterative depth-first search, so we can report the exact cycle
+        done = set()
+        for start in graph:
+            if start in done:
+                continue
+            path = [start]
+            on_path = {start}
+            iterators = [iter(graph[start])]
+            while iterators:
+                try:
+                    dependency = next(iterators[-1])
+                except StopIteration:
+                    iterators.pop()
+                    finished = path.pop()
+                    on_path.discard(finished)
+                    done.add(finished)
+                    continue
+
+                if dependency in on_path:
+                    cycle = path[path.index(dependency):] + [dependency]
+                    raise CircularDependencyError("Circular dependency detected: " + " -> ".join(cycle))
+
+                if dependency not in done:
+                    path.append(dependency)
+                    on_path.add(dependency)
+                    iterators.append(iter(graph[dependency]))
+
+    # ------------------------------------------------------------------
+    # Instantiation
+    # ------------------------------------------------------------------
+    def _instanciate_service(self, service_name, *extra_args, **extra_kwargs):
+        config = self.all_services_config[service_name]
+
+        if not config["is_singleton"]:
+            return self._build_service(service_name, extra_args, extra_kwargs)
+
+        with self._singleton_lock:
+            # 'in' instead of truthiness: an instance can legitimately be falsy
+            if service_name not in self.singleton_services:
+                self.singleton_services[service_name] = self._build_service(service_name, extra_args, extra_kwargs)
+            return self.singleton_services[service_name]
+
+    def _build_service(self, service_name, extra_args, extra_kwargs):
+        config = self.all_services_config[service_name]
+
+        arguments = [self._get_arg_value(arg, service_name) for arg in config["arguments"]]
+        kwargs = {key: self._get_arg_value(arg, service_name) for key, arg in config["named_arguments"].items()}
+        # Extra keyword arguments passed to get() win over the ones in the YAML
+        kwargs.update(extra_kwargs)
+
         try:
-            instance = clss(*arguments, *extra_args, **kwargs, **extra_kwargs)
+            clss = self._import_object(config["class"])
+        except (ImportError, AttributeError, ValueError) as e:
+            raise ImportingObjectError(
+                f"Couldn't import the class {config['class']} for service {service_name}"
+            ) from e
+
+        try:
+            return clss(*arguments, *extra_args, **kwargs)
         except TypeError as e:
-            if "__init__() got multiple values for argument" in e.args[0] and extra_args:
-                error = f"""The extra arguments order is undefined behavior when service dependencies also are defined to use arguements insteado of named_arguments.
-                If you are using extra arguments when instanciating the service, consider using key-word arguments.
-                If you need to pass extra non-key arguments when instanciating the service, consider using named_arguments in the service definition
-                original error {e}"""
-                raise ServiceArgumentsOrderError(error)
-            raise e
+            if extra_args and "got multiple values for argument" in str(e):
+                raise ServiceArgumentsOrderError(
+                    "The order of extra positional arguments is undefined behavior when the service "
+                    "dependencies are also defined with 'arguments' instead of 'named_arguments'. "
+                    "When instantiating the service with extra arguments, prefer keyword arguments. "
+                    "If you need extra positional arguments, use 'named_arguments' in the service definition. "
+                    f"Original error: {e}"
+                ) from e
+            raise
 
-        if self.all_services_config[service_name].get("is_singleton", False):
-            self.singleton_services[service_name] = instance
+    def _get_arg_value(self, arg, service_name):
+        # YAML can give us ints, floats, bools, lists... those are passed as they are
+        if not isinstance(arg, str):
+            return arg
 
-        return instance
-
-    def _get_arg_value(self, arg: str, service_name):
         if arg.startswith(self.OBJECT_REFERENCE):
             try:
                 return self._import_object(arg[1:])
-            except ImportError as e:
-                raise ImportingObjectError(f"Couldn't import object {arg} for service {service_name}")
-        elif arg.startswith(self.ENV_VAR_REFERENCE):
-            env_var = os.getenv(arg[1:])
-            return env_var.strip('"').strip("'") if type(env_var) is str else env_var
+            except (ImportError, AttributeError, ValueError) as e:
+                raise ImportingObjectError(f"Couldn't import object {arg} for service {service_name}") from e
 
-        elif arg.startswith(self.SERVICE_REFERENCE):
-            return self._instanciate_service(arg[1:])
+        if arg.startswith(self.ENV_VAR_REFERENCE):
+            env_var = os.getenv(arg[1:])
+            if env_var is None:
+                return None
+            return env_var.strip('"').strip("'")
+
+        if arg.startswith(self.SERVICE_REFERENCE):
+            # Go through get() so manually set services are also injected
+            return self.get(self._get_clean_service_name(arg))
 
         return arg
 
     def _import_object(self, path):
-        splitted_path = path.split(".")
-        module = importlib.import_module(".".join(splitted_path[:-1]))
-        imported_object = getattr(module, splitted_path[-1])
-        return imported_object
+        module_path, _, object_name = path.rpartition(".")
+        if not module_path:
+            raise ValueError(f"'{path}' must have the form 'package.module.object'")
+        module = importlib.import_module(module_path)
+        return getattr(module, object_name)
 
     def _get_clean_service_name(self, service_name):
         if service_name.startswith(self.SERVICE_REFERENCE):
             return service_name[1:].strip()
         return service_name
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def get(self, service_name, *extra_args, **extra_kwargs):
         if service_name in self.manually_set_services:
             return self.manually_set_services[service_name]

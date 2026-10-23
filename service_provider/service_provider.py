@@ -141,6 +141,10 @@ class ServiceProvider:
         if not extra_kwargs:
             extra_kwargs = {}
 
+        for key in extra_kwargs:
+            if key in kwargs:
+                kwargs.pop(key)
+
         try:
             clss = self._import_object(self.all_services_config[service_name]["class"])
         except ImportError:
